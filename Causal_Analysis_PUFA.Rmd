@@ -1,0 +1,452 @@
+---
+title: "Causal-methods analysis of PUFA:SFA and elevated cholesterol"
+subtitle: "STAT3888 | NNPAS 2011–2012 | Extension to PUFA Phase 3"
+author: "Gordon — PUFA study"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=TRUE,
+                      fig.width=9,fig.height=5,dpi=140,fig.align="center")
+options(scipen=5,digits=4)
+```
+
+# 1. Research question, design and identification limits
+
+**Question.** Among NNPAS biomedical respondents aged 18–64 who met the previous Phase 2 eligibility criteria, how does the prevalence of elevated total cholesterol differ between participants with a Day-1 **high** PUFA:SFA mass ratio (1.0–1.5) and **low** PUFA:SFA ratio (<0.45), after accounting for observed baseline-like covariates?
+
+The binary exposure is defined only among these two proposal-defined categories: `A=1` for high, `A=0` for low. Participants with other ratios are retained in previous Phase 3, but excluded from *this specific binary comparison*. The secondary outcome is elevated LDL cholesterol. The outcome is a binary indicator, **not** cholesterol measured in mmol/L.
+
+**Critical caveat.** This is an **observational, cross-sectional causal-methods sensitivity exercise**, **not an identified causal effect of changing dietary fat**. Day-1 intake is a one-day proxy rather than a well-defined dietary intervention; measured cholesterol, lipid medication, previous diagnosis and diet may influence one another. Temporal ordering, exchangeability, consistency, no interference, positivity, and correct models are not verified. Estimated contrasts must be described as **standardised / propensity-adjusted associations**. PUFA:SFA categories represent many possible food substitutions, so even the intervention definition is ambiguous.
+
+We compare three adjustment estimators under working assumptions:
+
+* **Outcome-regression standardisation (G-computation)**: predict risk in each group for the same observed covariate distribution.
+* **Inverse probability weighting (IPW)**: reweight high/low categories by the propensity score, alongside biomedical survey weights.
+* **Augmented IPW (AIPW)**: combine propensity and outcome models; its double-robustness property applies only under suitable identification and model assumptions.
+
+Our **primary covariate set** is age, sex, area socioeconomic disadvantage (SEIFA quintile), and remoteness. These variables are treated as relatively stable background variables. **Expanded adjustment** adds BMI, diabetes status and total daily energy, which may introduce overadjustment or mediator control because their causal timing is uncertain. Smoking and other diet-related confounders remain an important limitation; the original smoking coding requires separate validation. The primary analysis therefore cannot be treated as free from unmeasured confounding.
+
+**Weight warning:** The 60 biomedical replicate-weight columns and preliminary JK1 scaling are inherited from the supplied Phase 3 code. Their proper use for this ABS CURF must be verified against the survey's technical documentation **before** reporting design-based confidence intervals as final.
+
+# 2. Packages, paths, inputs
+
+```{r paths}
+packages <- c("data.table","ggplot2","knitr","survey")
+miss <- packages[!vapply(packages, requireNamespace, logical(1), quietly=TRUE)]
+if (length(miss)) stop("Install missing packages: install.packages(c(",
+                       paste(sprintf('"%s"',miss),collapse=", "),"))")
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(knitr)
+  library(survey)
+})
+theme_set(theme_minimal(base_size=12))
+
+# Save this Rmd beside Phase 1, Phase 2, Phase 3 and the original NNPAS CSVs.
+data_dir <- "."
+work_dir <- file.path(data_dir,"_STAT3888_PUFA_work")
+phase2_data <- file.path(work_dir,"phase2","data")
+nn_file <- file.path(phase2_data,"NNPAS_PUFA_cholesterol_study.rds")
+cohort_file <- file.path(phase2_data,"phase2_clean_cohort_with_raw_audit.rds")
+out_dir <- file.path(work_dir,"causal_analysis")
+tab_dir <- file.path(out_dir,"tables")
+fig_dir <- file.path(out_dir,"figures")
+dir.create(tab_dir,recursive=TRUE,showWarnings=FALSE)
+dir.create(fig_dir,recursive=TRUE,showWarnings=FALSE)
+if (!file.exists(nn_file) || !file.exists(cohort_file))
+  stop("Phase 2 RDS files missing. Run Cleaning_Phase1_PUFA.Rmd then Cleaning_Phase2_PUFA.Rmd first.")
+
+write_tab <- function(x,name) fwrite(as.data.table(x),file.path(tab_dir,name),na="")
+write_fig <- function(p,name,w=9,h=5) ggsave(file.path(fig_dir,name),p,
+                                               width=w,height=h,dpi=160)
+show_tab <- function(x,caption) knitr::kable(as.data.frame(x),caption=caption,digits=4)
+resolve_csv <- function(stem) {
+  fs <- list.files(data_dir,pattern="\\.csv$",ignore.case=TRUE,full.names=TRUE)
+  names <- basename(fs)
+  exact <- fs[tolower(names)==tolower(paste0(stem,".csv"))]
+  if (length(exact)==1L) return(exact)
+  if (length(exact)>1L) stop("Multiple exact versions of ",stem)
+  suffix <- fs[grepl(paste0("^",stem,"\\([0-9]+\\)\\.csv$"),names,ignore.case=TRUE)]
+  if (length(suffix)!=1L) stop("Cannot uniquely find ",stem,".csv or ",stem,"(number).csv in ",getwd())
+  suffix[[1L]]
+}
+```
+
+# 3. Causal graph and assumptions
+
+This conceptual directed acyclic graph shows **plausible** relationships, not relationships validated by the current data. 'Underlying health & history' includes prior dyslipidaemia, medication, long-term diet and other factors that can produce reverse causation or confounding. A single-day PUFA:SFA ratio is an imperfect measurement of habitual diet. Conditioning on the biomedical/fasting selection may also generate selection bias.
+
+```{r dag-figure}
+nodes <- data.table(
+  node=c("Demographics","SES / location","Lifestyle / prior health",
+         "Habitual diet","Day-1 PUFA:SFA","Cholesterol status"),
+  x=c(1,1,1,3.1,5.1,7.4),y=c(3,2,1,2,2,2))
+edges <- data.table(
+  from=c("Demographics","Demographics","SES / location","SES / location",
+         "Lifestyle / prior health","Lifestyle / prior health",
+         "Habitual diet","Habitual diet"),
+  to=c("Habitual diet","Cholesterol status","Habitual diet","Cholesterol status",
+       "Habitual diet","Cholesterol status","Day-1 PUFA:SFA","Cholesterol status"))
+edges <- merge(edges,nodes[,.(from=node,x0=x,y0=y)],by="from")
+edges <- merge(edges,nodes[,.(to=node,x1=x,y1=y)],by="to")
+p_dag <- ggplot()+
+  geom_segment(data=edges,aes(x=x0,y=y0,xend=x1,yend=y1),
+               arrow=grid::arrow(length=grid::unit(0.18,"cm")),colour="grey40")+
+  geom_label(data=nodes,aes(x=x,y=y,label=node),fill="white",size=3.2,label.size=.35)+
+  coord_cartesian(xlim=c(.2,8.4),ylim=c(.3,3.8),clip="off")+
+  theme_void()+labs(title="Conceptual DAG: potential confounding and measurement")
+print(p_dag)
+write_fig(p_dag,"01_conceptual_dag.png",11,4.8)
+```
+
+# 4. Assemble high-versus-low NNPAS cohort
+
+```{r load-data}
+nn <- as.data.table(readRDS(nn_file))
+cohort <- as.data.table(readRDS(cohort_file))
+core_nn <- c("ABSPID","age","sex","pufa_sfa_ratio","pufa_sfa_group",
+             "total_chol_elevated","ldl_chol_elevated","biomedical_weight",
+             "bmi","diabetes_current","energy_kj_day1","lipid_medication_group",
+             "omega3_proxy_pct_pufa")
+extra <- c("ABSPID","seifa_quintile","remoteness")
+if (length(setdiff(core_nn,names(nn)))) stop("Missing Phase 2 PUFA fields: ",paste(setdiff(core_nn,names(nn)),collapse=", "))
+if (length(setdiff(extra,names(cohort)))) stop("Missing Phase 2 full-cohort fields: ",paste(setdiff(extra,names(cohort)),collapse=", "))
+if (anyDuplicated(nn$ABSPID) || anyDuplicated(cohort$ABSPID)) stop("ABSPID must be unique in both Phase 2 files")
+if (!all(nn$total_chol_elevated[!is.na(nn$total_chol_elevated)] %in% 0:1))
+  stop("Outcome total_chol_elevated must be binary 0/1/NA")
+extra_dt <- cohort[,..extra]
+if (nrow(extra_dt)!=nrow(nn)) warning("Full cohort and slim study tables differ in n; merge is checked below")
+n0 <- nrow(nn)
+dt <- merge(nn,extra_dt,by="ABSPID",all.x=TRUE,sort=FALSE)
+stopifnot(nrow(dt)==n0)
+
+raw_bio <- resolve_csv("AHSnpa11bb")
+rep_cols <- sprintf("RPWGT%02d",1:60)
+header <- names(fread(raw_bio,nrows=0,showProgress=FALSE))
+if (!all(c("ABSPID",rep_cols) %in% header)) stop("Biomed source missing replicate weights")
+rep_dt <- fread(raw_bio,select=c("ABSPID",rep_cols),showProgress=FALSE)
+if (anyDuplicated(rep_dt$ABSPID)) stop("Duplicate ABSPID in replicate weight data")
+n0 <- nrow(dt)
+dt <- merge(dt,rep_dt,by="ABSPID",all.x=TRUE,sort=FALSE)
+stopifnot(nrow(dt)==n0)
+
+# Use only high versus low.  'Other ratios' remain in Phase 3, outside this contrast.
+dt[, exposure := fifelse(pufa_sfa_group=="High: 1.0-1.5",1L,
+                 fifelse(pufa_sfa_group=="Low: <0.45",0L,NA_integer_))]
+dt[, `:=`(
+  sex=factor(as.character(sex)),
+  seifa_quintile=factor(as.character(seifa_quintile)),
+  remoteness=factor(as.character(remoteness)),
+  diabetes_status=factor(diabetes_current,levels=0:1,
+                         labels=c("No diabetes","Diabetes"))
+)]
+
+# Primary adjustment excludes potential intermediates (BMI, diabetes, energy).
+core_covars <- c("age","sex","seifa_quintile","remoteness")
+expanded_covars <- c(core_covars,"bmi","diabetes_status","energy_kj_day1")
+required <- c("exposure","total_chol_elevated","biomedical_weight",core_covars,rep_cols)
+for (nm in c("age","bmi","energy_kj_day1","biomedical_weight",rep_cols))
+  if (nm %in% names(dt)) dt[, (nm) := suppressWarnings(as.numeric(get(nm)))]
+base <- copy(dt[!is.na(exposure) & complete.cases(dt[,..required]) &
+                is.finite(biomedical_weight) & biomedical_weight>0])
+if (any(!is.finite(as.matrix(base[,..rep_cols]))) || any(as.matrix(base[,..rep_cols])<0))
+  stop("Invalid replicate weights")
+if (any(table(base$exposure)<20)) stop("Too few high or low participants for this model")
+if (length(unique(base$total_chol_elevated))!=2L) stop("Only one outcome class in the selected sample")
+base[, `:=`(sex=droplevels(sex),seifa_quintile=droplevels(seifa_quintile),
+            remoteness=droplevels(remoteness))]
+
+flow <- data.table(stage=c("Phase 2 PUFA cohort","High or low ratio, outcome present",
+                            "Primary analysis with SES/location complete","High group in primary sample",
+                            "Low group in primary sample"),
+                   participants=c(nrow(dt),
+                      nrow(dt[!is.na(exposure) & !is.na(total_chol_elevated)]),
+                      nrow(base),sum(base$exposure==1),sum(base$exposure==0)))
+write_tab(flow,"01_sample_flow.csv")
+show_tab(flow,"High versus low comparison sample")
+```
+
+# 5. Working estimands and survey weighting
+
+If a sufficiently defined intervention and identification conditions existed, the estimand would be a risk difference or risk ratio for the **high-versus-low Day-1 category comparison among eligible high/low participants**. In practice, the numeric outputs are adjusted associations, and the target population is further restricted by biomedical sampling and complete-case selection.
+
+For `A` the binary category, `Y` the elevated cholesterol indicator, `X` the adjustment set, `e(X)=P(A=1|X)`, and outcome predictions `m_a(X)=P(Y=1|A=a,X)`, we compute:
+
+\[
+\begin{aligned}
+\widehat\mu_a^{G} &= \frac{\sum_i w_i\widehat m_a(X_i)}{\sum_i w_i},\\
+\widehat\mu_1^{IPW} &= \frac{\sum_i w_i A_iY_i/\widehat e_i}{\sum_i w_i A_i/\widehat e_i},\\
+\widehat\mu_0^{IPW} &= \frac{\sum_i w_i (1-A_i)Y_i/(1-\widehat e_i)}{\sum_i w_i(1-A_i)/(1-\widehat e_i)},\\
+\widehat\mu_a^{AIPW} &= \frac{\sum_i w_i\{\widehat m_a(X_i)+I(A_i=a)(Y_i-\widehat m_a(X_i))/\widehat p_a(X_i)\}}{\sum_i w_i}.
+\end{aligned}
+\]
+
+Here `w_i` are the NNPAS biomedical weights, and `p_1=e`, `p_0=1-e`. IPW is shown as a **Hájek ratio**. For each method, report `risk(high)`, `risk(low)`, their difference (high minus low) and risk ratio (high/low). Standard errors below are provisional replicate-weight results using the **same unverified JK1 convention as Phase 3**.
+
+# 6. Estimation functions and balance diagnostics
+
+```{r estimators}
+# Avoid apparent 0-1 probabilities caused by numerical roundoff; diagnose extremes.
+wm <- function(x,w) sum(w*x)/sum(w)
+ess <- function(w) { if (!any(w>0)) return(NA_real_); sum(w)^2/sum(w^2) }
+
+calc_estimates <- function(d, raw_weights, covariates, ps_clip=0) {
+  stopifnot(length(raw_weights)==nrow(d),all(is.finite(raw_weights)),all(raw_weights>=0),sum(raw_weights)>0)
+  z <- copy(d)
+  w <- as.numeric(raw_weights)
+  # Rescale expansion weights; all estimands are invariant to global scaling.
+  z[, .weight_model := w/(sum(w)/sum(w>0))]
+  f_ps <- reformulate(covariates,response="exposure")
+  f_y  <- reformulate(c("exposure",covariates),response="total_chol_elevated")
+  ps_fit <- suppressWarnings(glm(f_ps,data=z,weights=.weight_model,
+                                 family=quasibinomial(),control=glm.control(maxit=100)))
+  y_fit <- suppressWarnings(glm(f_y,data=z,weights=.weight_model,
+                                family=quasibinomial(),control=glm.control(maxit=100)))
+  if (!isTRUE(ps_fit$converged) || !isTRUE(y_fit$converged)) stop("Propensity or outcome GLM did not converge")
+  ps_raw <- as.numeric(predict(ps_fit,newdata=z,type="response"))
+  if (any(!is.finite(ps_raw)) || any(ps_raw<=0) || any(ps_raw>=1))
+    stop("Propensity scores 0/1 or undefined: non-overlap or separation")
+  ps <- if (ps_clip>0) pmin(1-ps_clip,pmax(ps_clip,ps_raw)) else ps_raw
+  z0 <- copy(z); z0[, exposure := 0L]
+  z1 <- copy(z); z1[, exposure := 1L]
+  m0 <- as.numeric(predict(y_fit,newdata=z0,type="response"))
+  m1 <- as.numeric(predict(y_fit,newdata=z1,type="response"))
+  if (any(!is.finite(c(m0,m1))) || any(c(m0,m1)<0 | c(m0,m1)>1))
+    stop("Invalid outcome-model predictions")
+  a <- z$exposure; y <- z$total_chol_elevated
+  w0 <- w*(1-a)/(1-ps)
+  w1 <- w*a/ps
+  mu_g <- c(low=wm(m0,w),high=wm(m1,w))
+  mu_ipw <- c(low=wm(y,w0),high=wm(y,w1))
+  mu_dr <- c(low=wm(m0+(1-a)/(1-ps)*(y-m0),w),
+             high=wm(m1+a/ps*(y-m1),w))
+  means <- list(Gcomp=mu_g,IPW=mu_ipw,AIPW=mu_dr)
+  result <- unlist(lapply(means,function(mu) c(low=mu[[1]],high=mu[[2]],
+                                                  RD=mu[[2]]-mu[[1]],
+                                                  logRR=if (all(mu>0)) log(mu[[2]]/mu[[1]]) else NA_real_)))
+  if (any(!is.finite(result))) stop("Invalid risk estimate or log-RR; inspect propensity overlap")
+  list(est=result,
+       diagnostics=data.table(min_ps=min(ps_raw),p01_ps=unname(quantile(ps_raw,.01)),
+         median_ps=median(ps_raw),p99_ps=unname(quantile(ps_raw,.99)),
+         max_ps=max(ps_raw),treated_n=sum(a==1),control_n=sum(a==0),
+         ipw_ESS_treated=ess(w1),ipw_ESS_control=ess(w0),
+         max_ipw_multiplier=max(c(1/ps[a==1],1/(1-ps[a==0]))),
+         n_ps_clipped=sum(ps!=ps_raw)),
+       propensity=ps_raw,ipw_weights=ifelse(a==1,w1,w0),
+       model_ps=ps_fit,model_outcome=y_fit)
+}
+
+# Weighted standardized mean difference for numerical/binary dummy covariates.
+wstats <- function(x,w) {
+  ok <- is.finite(x) & is.finite(w) & w>0
+  if (!any(ok)) return(c(m=NA_real_,v=NA_real_))
+  x <- x[ok];w <- w[ok];m <- wm(x,w)
+  c(m=m,v=wm((x-m)^2,w))
+}
+calc_balance <- function(d, exposure_w, covariates,method) {
+  mm <- model.matrix(reformulate(covariates),data=d)
+  mm <- mm[,colnames(mm)!="(Intercept)",drop=FALSE]
+  rbindlist(lapply(seq_len(ncol(mm)),function(j) {
+    xx <- mm[,j];a <- d$exposure
+    s1 <- wstats(xx[a==1],exposure_w[a==1]);s0 <- wstats(xx[a==0],exposure_w[a==0])
+    den <- sqrt((s1["v"]+s0["v"])/2)
+    data.table(variable=colnames(mm)[j],method=method,
+      weighted_difference=unname(s1["m"]-s0["m"]),
+      SMD=if (is.finite(den) && den>0) unname((s1["m"]-s0["m"])/den) else NA_real_)
+  }))
+}
+```
+
+# 7. Primary analysis: core demographic/geographic adjustment
+
+```{r primary}
+primary <- calc_estimates(base,base$biomedical_weight,core_covars)
+cat("Primary high-versus-low sample:",nrow(base),"participants\n")
+show_tab(primary$diagnostics,"Propensity score and IPW effective sample size diagnostics")
+if (primary$diagnostics$ipw_ESS_treated<30)
+  warning("Treated-group effective sample size <30. The comparison is weakly supported; avoid a causal claim.")
+if (primary$diagnostics$min_ps<0.01 || primary$diagnostics$max_ps>0.99)
+  warning("Extreme propensity scores: overlap/positivity is questionable.")
+write_tab(primary$diagnostics,"02_propensity_and_ESS.csv")
+
+base[, propensity_score := primary$propensity]
+p_ps <- ggplot(base,aes(x=propensity_score,weight=biomedical_weight,
+                        colour=factor(exposure,levels=0:1,labels=c("Low ratio","High ratio"))))+
+  geom_density(linewidth=1,adjust=1.2)+
+  labs(title="Propensity-score overlap, high versus low ratios",
+       x="Estimated P(high ratio | observed covariates)",y="Survey-weighted density",colour="Observed ratio group")
+print(p_ps);write_fig(p_ps,"02_propensity_overlap.png")
+
+balance <- rbind(calc_balance(base,base$biomedical_weight,core_covars,"Before IPW"),
+                 calc_balance(base,primary$ipw_weights,core_covars,"After IPW"))
+write_tab(balance,"03_covariate_balance_SMD.csv")
+show_tab(balance,"Covariate balance: absolute standardised mean difference ideally below 0.1")
+p_bal <- ggplot(balance,aes(x=abs(SMD),y=variable,colour=method))+
+  geom_point(size=2.3,position=position_dodge(width=.5))+
+  geom_vline(xintercept=.1,linetype="dashed",colour="grey40")+
+  labs(title="Balance before and after IPW",x="Absolute standardised mean difference",y=NULL)+
+  theme(legend.position="bottom")
+print(p_bal);write_fig(p_bal,"03_love_plot.png",9,6)
+if (any(abs(balance$SMD[balance$method=="After IPW"])>.1,na.rm=TRUE))
+  warning("Some covariates remain imbalanced after IPW. Avoid interpreting the IPW estimate as controlled for confounding.")
+```
+
+# 8. Replicate-weight intervals for the main comparison
+
+Refit **both** nuisance models for each of the 60 replicate weights, carrying parameter-estimation uncertainty into G-computation, IPW and AIPW. A failed replicate invalidates its uncertainty estimate: intervals are **not** fabricated from incomplete replicates. These are provisional JK1 intervals pending verification of the ABS CURF weight instructions.
+
+```{r replicate-uncertainty}
+run_replicates <- TRUE  # Set FALSE for a quick exploratory run without CIs.
+# Same provisional convention as Phase 3. Change ONLY if supported by ABS technical documentation.
+jk_scale <- 59/60
+critical <- qt(.975,df=59)
+stat_names <- names(primary$est)
+rep_matrix <- matrix(NA_real_,nrow=length(stat_names),ncol=length(rep_cols),
+                     dimnames=list(stat_names,rep_cols))
+errors <- data.table(replicate=character(),error=character())
+if (run_replicates) {
+  for (j in seq_along(rep_cols)) {
+    rc <- rep_cols[[j]]
+    fit <- tryCatch(calc_estimates(base,base[[rc]],core_covars),
+                    error=function(e)e)
+    if (inherits(fit,"error")) {
+      errors <- rbind(errors,data.table(replicate=rc,error=conditionMessage(fit)))
+    } else {
+      rep_matrix[,j] <- fit$est[stat_names]
+    }
+  }
+}
+write_tab(errors,"04_failed_replicates.csv")
+if (nrow(errors)>0) warning("At least one jackknife replicate failed; its CI is intentionally omitted.")
+se <- setNames(rep(NA_real_,length(stat_names)),stat_names)
+if (run_replicates && !nrow(errors) && all(is.finite(rep_matrix))) {
+  se <- sqrt(jk_scale*rowSums((rep_matrix-primary$est[stat_names])^2))
+}
+make_results <- function(est,se,label) {
+  meth <- c("Gcomp","IPW","AIPW")
+  rbindlist(lapply(meth,function(m) {
+    ests <- est[paste0(m,".",c("low","high","RD","logRR"))]
+    ses  <- se[paste0(m,".",c("low","high","RD","logRR"))]
+    rr <- exp(ests[[4]])
+    data.table(model=label,method=m,
+      risk_low=ests[[1]],risk_high=ests[[2]],
+      RD_high_minus_low=ests[[3]],RR_high_over_low=rr,
+      RD_CI_low=if (is.finite(ses[[3]])) ests[[3]]-critical*ses[[3]] else NA_real_,
+      RD_CI_high=if (is.finite(ses[[3]])) ests[[3]]+critical*ses[[3]] else NA_real_,
+      RR_CI_low=if (is.finite(ses[[4]])) exp(ests[[4]]-critical*ses[[4]]) else NA_real_,
+      RR_CI_high=if (is.finite(ses[[4]])) exp(ests[[4]]+critical*ses[[4]]) else NA_real_)
+  }))
+}
+primary_results <- make_results(primary$est,se,"Primary: age, sex, SEIFA, remoteness")
+write_tab(primary_results,"05_primary_causal_methods_comparison.csv")
+show_tab(primary_results,"Working G-computation, IPW and AIPW contrasts (not identified causal effects)")
+```
+
+# 9. Sensitivity analyses
+
+These analyses probe sensitivity of **adjusted associations** to additional covariates, extreme propensity scores, cholesterol medication use, and a different endpoint. Different complete-case restrictions can change the analysis sample. Estimates here are point estimates only; they should **not** be interpreted as independently significant without their own appropriate intervals.
+
+```{r sensitivity}
+sens <- list()
+add_sensitivity <- function(label,d,covars,clip=0,outcome="total_chol_elevated") {
+  tmp <- copy(d)
+  tmp[, total_chol_elevated := get(outcome)]
+  need <- c("exposure","total_chol_elevated",covars,"biomedical_weight")
+  tmp <- tmp[complete.cases(tmp[,..need])]
+  if (nrow(tmp)<100 || min(table(tmp$exposure))<20 || length(unique(tmp$total_chol_elevated))<2L) {
+    return(data.table(model=label,n=nrow(tmp),method="Not fitted",RD=NA_real_,RR=NA_real_,note="Too few observed outcomes/exposed participants"))
+  }
+  out <- tryCatch(calc_estimates(tmp,tmp$biomedical_weight,covars,ps_clip=clip),
+                  error=function(e)e)
+  if (inherits(out,"error"))
+    return(data.table(model=label,n=nrow(tmp),method="Not fitted",RD=NA_real_,RR=NA_real_,note=conditionMessage(out)))
+  res <- rbindlist(lapply(c("Gcomp","IPW","AIPW"),function(m) data.table(
+    model=label,n=nrow(tmp),method=m,
+    RD=unname(out$est[paste0(m,".RD")]),
+    RR=exp(unname(out$est[paste0(m,".logRR")])),note="Point estimate only")))
+  res
+}
+sens[[1]] <- add_sensitivity("Primary again",base,core_covars)
+sens[[2]] <- add_sensitivity("Extended: BMI, diabetes, energy",base,expanded_covars)
+sens[[3]] <- add_sensitivity("Propensity clipped to 0.02–0.98",base,core_covars,clip=.02)
+sens[[4]] <- add_sensitivity("Propensity clipped to 0.05–0.95",base,core_covars,clip=.05)
+sens[[5]] <- add_sensitivity("Exclude users of lipid-lowering medication",
+                             base[lipid_medication_group=="No lipid medication"],core_covars)
+sens[[6]] <- add_sensitivity("LDL cholesterol secondary outcome",base,core_covars,
+                             outcome="ldl_chol_elevated")
+sensitivity_table <- rbindlist(sens,fill=TRUE)
+write_tab(sensitivity_table,"06_sensitivity_analyses.csv")
+show_tab(sensitivity_table,"Sensitivity checks; do not use these point estimates as significance tests")
+```
+
+# 10. Omega-3 contribution: exploratory effect modification
+
+This section follows the project proposal and asks whether the **association** between high versus low PUFA:SFA and elevated total cholesterol differs with the measured proportion of omega-3 in total PUFA. This is **not** a separate identified causal effect of omega-3. Omega-3 share is a component/denominator-based quantity, and the high-ratio group is small. The coefficient for an interaction on the log-odds scale does not by itself demonstrate a nutrient-replacement effect.
+
+```{r omega3-exploratory}
+omega <- copy(base[is.finite(omega3_proxy_pct_pufa) &
+                     omega3_proxy_pct_pufa>=0 & omega3_proxy_pct_pufa<=100])
+omega[, omega3_per10 := omega3_proxy_pct_pufa/10]
+omega_results <- data.table(note="Exploratory interaction not fitted")
+if (nrow(omega)>100 && min(table(omega$exposure))>=20) {
+  # Replicate-weight estimation as in Phase 3; scale is provisional.
+  des_omega <- svrepdesign(data=omega,weights=~biomedical_weight,
+                          repweights=as.matrix(omega[,..rep_cols]),
+                          type="JK1",scale=jk_scale,rscales=rep(1,length(rep_cols)),
+                          combined.weights=TRUE,mse=TRUE)
+  f_omega <- total_chol_elevated ~ exposure*omega3_per10 +
+    age + sex + seifa_quintile + remoteness
+  fit_omega <- svyglm(f_omega,design=des_omega,family=quasibinomial())
+  sm <- summary(fit_omega)$coefficients
+  interesting <- intersect(c("exposure","omega3_per10","exposure:omega3_per10"),rownames(sm))
+  if (length(interesting)) {
+    se_omega <- sm[interesting,"Std. Error"]
+    beta_omega <- sm[interesting,"Estimate"]
+    tcrit <- qt(.975,df=max(1,degf(des_omega)))
+    omega_results <- data.table(term=interesting,logOR=as.numeric(beta_omega),
+         SE=as.numeric(se_omega),OR=exp(beta_omega),
+         CI_low=exp(beta_omega-tcrit*se_omega),
+         CI_high=exp(beta_omega+tcrit*se_omega),
+         p_value=2*pt(-abs(beta_omega/se_omega),df=max(1,degf(des_omega))))
+  }
+}
+write_tab(omega_results,"07_omega3_exploratory_interaction.csv")
+show_tab(omega_results,"Exploratory omega-3 composition interaction; no causal claim")
+```
+
+# 11. Interpretability, reporting and limitations
+
+**Do not describe the estimates above as proven effects of changing PUFA to SFA**. In particular:
+
+1. A single 24-hour dietary recall imperfectly measures long-run intake and precedes neither the measured cholesterol nor medication history in an established causal timeline.
+2. Medication use and previous high cholesterol could influence diet; reverse causation and residual confounding are plausible.
+3. Conditioning on fasting biomedical eligibility, a classifiable medication response and complete cases can create selection bias.
+4. The high PUFA:SFA group is relatively small; report effective sample sizes, propensity distributions and the full balance diagnostic. If overlap is weak, a population causal contrast is poorly supported.
+5. The intervention is underspecified: a ratio can change through many combinations of PUFA, SFA and total calories. An observed contrast cannot isolate a particular fat-replacement mechanism.
+6. Adjustment for diabetes, BMI and total energy may change estimates through confounding control **or** overadjustment; chronological ordering is unavailable.
+7. Replicate-weight inference here reproduces Phase 3's **provisional** JK1 method, which must be cross-checked with the survey's official variance-estimation instructions.
+8. The prior Phase 3 omega-3 contribution analysis is **associational**. Its one-day omega-3 proxy and PUFA denominator do not identify a causal effect of increasing omega-3 relative to omega-6.
+
+The correct description for group discussions is: **"An exploratory causal-inference framework using propensity-score weighting, outcome standardisation, and AIPW, with overlap and balance diagnostics. Given the cross-sectional survey and unresolved identification assumptions, findings are interpreted as adjusted associations, not established causal effects."**
+
+```{r final-audit}
+audit <- data.table(
+  item=c("Input high/low eligible complete cases","High cases","Low cases",
+         "Replicate-weight columns used","Replicate-weight failures",
+         "Provisional JK1 scale","Causal identification confirmed"),
+  value=c(nrow(base),sum(base$exposure==1),sum(base$exposure==0),
+          length(rep_cols),nrow(errors),jk_scale,"NO — cross-sectional observational study"))
+write_tab(audit,"08_run_audit.csv")
+show_tab(audit,"Reproducibility audit")
+writeLines(capture.output(sessionInfo()),file.path(out_dir,"R_session_info.txt"))
+cat("\nSaved causal-analysis outputs to: ",normalizePath(out_dir),"\n",sep="")
+```
