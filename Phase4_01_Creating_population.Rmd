@@ -1,0 +1,127 @@
+---
+title: "STAT3888 — Phase 4: Creating population"
+subtitle: "Gordon | NNPAS 2011–12 | PUFA:SFA and blood lipid outcomes"
+author: "Gordon"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+source('_phase4_utils.R')
+sources <- phase4_load(reps=TRUE)
+d <- sources$data
+rep_cols <- sources$replicate_columns
+base <- phase4_primary(copy(d), rep_cols)
+```
+
+# Research focus and population
+
+**Question:** Among Australian adult NNPAS 2011–12 biomedical respondents aged 18–64, is the Day-1 PUFA:SFA intake ratio associated with elevated total cholesterol and elevated LDL cholesterol?
+
+This phase documents the **existing Phase 2 NNPAS cohort** and creates the subset used by Gordon's causal-methods analysis. The objective is consistency and reproducibility, using Stacy's population-audit structure. The working datasets were already restricted to fasting biomedical respondents; we cannot use them to reconstruct non-fasting participants.
+
+# 1. Data sources and participant matching
+
+* `NNPAS_PUFA_cholesterol_study.rds`: Phase 2 dietary exposure, outcomes, sampling weights and demographic fields.
+* `phase2_clean_cohort_with_raw_audit.rds`: age, geographical variables, fasting status and audit fields.
+* `AHSnpa11bb.csv`: original biomedical file for the 60 replicate weights and biomedical weight cross-check.
+
+All three sources are linked by the participant identifier `ABSPID`. The pipeline requires one row per participant in each input and stops on duplicates or weight discrepancies.
+
+```{r match-audit}
+match_audit <- data.table(
+  check = c('Participants in Phase 2 study file', 'Participants after linking all sources',
+            'Duplicate ABSPID', 'Complete biomedical expansion weight',
+            'Fasted >= 8 hours (FASTSTAD = 1)', 'Replicate-weight columns'),
+  value = c(nrow(readRDS(locate_file('NNPAS_PUFA_cholesterol_study','rds'))),
+            nrow(d), sum(duplicated(d$ABSPID)),
+            sum(!is.na(d$biomedical_weight) & d$biomedical_weight>0),
+            sum(d$FASTSTAD==1,na.rm=TRUE), length(rep_cols))
+)
+format_table(match_audit, 'Linked cohort validation')
+save_table(match_audit, 'r_01_link_audit.csv')
+```
+
+# 2. Existing Phase 2 population
+
+**Important:** The 2,322-person RDS dataset is a previously filtered *fasting biomedical cohort*. The NNPAS national sample contained more participants before the earlier screening, but those earlier records are not present in these RDS files. Reconstructing Stacy's outcome-specific samples would require the original person-level nutrition dataset and an earlier unrestricted cohort.
+
+```{r full-pop}
+all_groups <- d[, .(N=.N), by=pufa_sfa_group][order(match(pufa_sfa_group,
+             c('Low: <0.45','Other ratios','High: 1.0-1.5')))]
+format_table(all_groups,'Phase 2 PUFA:SFA classification')
+save_table(all_groups, 'r_02_phase2_groups.csv')
+```
+
+# 3. Exposure and lipid outcomes
+
+The exposure is the ratio of Day-1 PUFA grams to Day-1 SFA grams. The pre-defined groups are:
+
+* **Low:** PUFA:SFA below 0.45;
+* **High:** PUFA:SFA from 1.0 to 1.5 inclusive;
+* **Other:** All remaining valid ratios, retained for descriptive analysis but excluded from the binary high-versus-low comparison.
+
+The primary outcome `total_chol_elevated` is binary, as is the secondary `ldl_chol_elevated`. These should not be treated as exact cholesterol concentrations in mmol/L. Validity and category thresholds come from the prior Phase 2 recoding and should remain traceable to the ABS biomedical codebook.
+
+```{r eligibility}
+status <- data.table(
+  measure=c('Total cholesterol observed','LDL cholesterol observed',
+            'Both outcomes observed','Day-1 ratio observed', 'Fasting indicator == 1'),
+  participants=c(sum(!is.na(d$total_chol_elevated)),
+                 sum(!is.na(d$ldl_chol_elevated)),
+                 sum(complete.cases(d[,.(total_chol_elevated,ldl_chol_elevated)])),
+                 sum(is.finite(d$pufa_sfa_ratio)),
+                 sum(d$FASTSTAD==1, na.rm=TRUE)))
+format_table(status,'Data availability in the linked Phase 2 cohort')
+save_table(status,'r_03_outcome_availability.csv')
+```
+
+# 4. Construction of the main analysis population
+
+The primary estimand compares only participants in the proposal-defined High and Low PUFA:SFA categories, with valid total-cholesterol status, positive biomedical weight, and complete age, sex, SEIFA and remoteness covariates plus 60 replicate weights.
+
+```{r flow}
+flow <- data.table(
+  stage=c('Linked Phase 2 fasting cohort',
+          'High or Low PUFA:SFA category',
+          'High/Low with observed total cholesterol',
+          'Complete-case primary analysis',
+          'High: 1.0–1.5 (primary sample)',
+          'Low: <0.45 (primary sample)'),
+  N=c(nrow(d),sum(!is.na(d$exposure)),
+       sum(!is.na(d$exposure)&!is.na(d$total_chol_elevated)),
+       nrow(base),sum(base$exposure==1),sum(base$exposure==0)))
+format_table(flow,'Cohort-selection flow')
+save_table(flow,'r_04_main_sample_flow.csv')
+```
+
+```{r outcome-groups}
+yaudit <- rbindlist(lapply(c('total_chol_elevated','ldl_chol_elevated'),function(outcome){
+  d[,.(N=sum(!is.na(get(outcome))), abnormal=sum(get(outcome)==1,na.rm=TRUE)),by=pufa_sfa_group][,
+    outcome:=outcome]
+}))
+setcolorder(yaudit,c('outcome','pufa_sfa_group','N','abnormal'))
+format_table(yaudit,'Outcome-specific observed cases by dietary ratio group')
+save_table(yaudit,'r_05_outcome_by_group.csv')
+```
+
+# 5. Adjustment variables and weights
+
+The primary adjustment set follows the prior Gordon Rmd: age, sex, SEIFA quintile and remoteness. This is a working set of relatively stable characteristics, not proof that all confounding is controlled. The expanded sensitivity set adds BMI, diabetes and total energy intake; the chronological roles of these variables are uncertain.
+
+Sampling prevalence estimates should use `biomedical_weight`/`NHMSPERW`. Model inference uses the 60 original `RPWGT01`–`RPWGT60` replicate weights with a Delete-a-Group Jackknife scheme. Appropriate survey design, degrees of freedom and variance settings should be verified against ABS technical guidance before final submission.
+
+# 6. Remaining work and limitations
+
+1. All 2,322 current Phase 2 records satisfy fasting criteria. Non-fasting records are unavailable in this extract, so comparisons with Stacy's broader cholesterol populations must clearly state different cohort definitions.
+2. The High category contains only `r sum(base$exposure==1)` individuals in the primary sample, which may undermine overlap and precision.
+3. A one-day food recall does not necessarily represent habitual dietary intake.
+4. This dataset contains direct binary measures for total and LDL cholesterol. The four-endpoint comparison from Stacy's study requires additional outcome construction, not merely renaming existing variables.
+5. Survey-weighted inference, outcome recoding and missingness should be explicitly reported in the next two Phase 4 files.
+
+**Current progress:** The linked Phase 2 dataset, exposure groups, outcome auditing and primary analytic cohort are constructed. The next documents provide EDA and adjusted associations.

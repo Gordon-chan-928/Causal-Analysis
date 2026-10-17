@@ -1,0 +1,119 @@
+---
+title: "STAT3888 — Phase 4: EDA"
+subtitle: "Gordon | PUFA:SFA ratio, elevated cholesterol, and omega-3 composition"
+author: "Gordon"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+source('_phase4_utils.R')
+d <- phase4_load(reps=FALSE)$data
+group_order <- c('Low: <0.45','Other ratios','High: 1.0-1.5')
+d[, pufa_sfa_group := factor(pufa_sfa_group, levels=group_order)]
+```
+
+# Exploratory Data Analysis
+
+# 1. Definition of elevated or abnormal blood lipids
+
+For this exploratory analysis, use the binary outcomes inherited from Phase 2:
+
+* Elevated total cholesterol: `total_chol_elevated`.
+* Elevated LDL cholesterol: `ldl_chol_elevated`.
+
+The ABS biomedical source provides **ranged laboratory categories**, which Phase 2 converted to binary values. These summaries describe high-cholesterol *prevalence*, not mean cholesterol concentrations. Low HDL and high triglycerides are not reconstructed in this Gordon Phase 4 dataset.
+
+# 2. Group sizes and ratio distribution
+
+```{r sizes}
+sizes <- d[,.(N=.N, ratio_median=median(pufa_sfa_ratio,na.rm=TRUE),
+              PUFA_g_mean=mean(polyunsaturated_fat_g_day1,na.rm=TRUE),
+              SFA_g_mean=mean(saturated_fat_g_day1,na.rm=TRUE)),
+           by=pufa_sfa_group][order(pufa_sfa_group)]
+format_table(sizes,'PUFA:SFA groups and intake characteristics')
+save_table(sizes,'r_11_ratio_groups.csv')
+```
+
+```{r ratio-histogram, fig.cap='Day-1 PUFA:SFA distribution, restricted to the existing fasting biomedical cohort'}
+p_ratio <- ggplot(d[is.finite(pufa_sfa_ratio)],aes(x=pufa_sfa_ratio))+
+  geom_histogram(bins=40,fill='#365C80',color='white')+
+  geom_vline(xintercept=c(0.45,1.0,1.5), linetype='dashed',color='#7A8795')+
+  coord_cartesian(xlim=c(0,2.0))+
+  labs(x='PUFA:SFA ratio',y='Number of participants',
+       title='Distribution of observed Day-1 PUFA:SFA ratios')+
+  theme_minimal(base_size=12)
+print(p_ratio)
+save_figure(p_ratio,'r_11_ratio_distribution.png')
+```
+
+# 3. Abnormal lipid prevalence across PUFA:SFA groups
+
+For each group, compute the number of participants with observed outcome measurements, number of abnormal outcomes, ordinary percent and the biomedical survey-weighted percent. The unweighted and weighted figures answer different questions; they are not interchangeable.
+
+```{r outcome-summary}
+eda <- rbindlist(lapply(c('total_chol_elevated','ldl_chol_elevated'),function(oc){
+  d[!is.na(get(oc)),.(N=.N,Abnormal_N=sum(get(oc)==1),
+    Raw_percent=100*mean(get(oc)),
+    Weighted_percent=100*wmean(get(oc),biomedical_weight)),by=pufa_sfa_group][,
+    Outcome:=ifelse(oc=='total_chol_elevated','Elevated total cholesterol','Elevated LDL')]
+}))
+setcolorder(eda,c('Outcome','pufa_sfa_group','N','Abnormal_N','Raw_percent','Weighted_percent'))
+setorder(eda,Outcome,pufa_sfa_group)
+format_table(eda,'Descriptive prevalence: raw and biomedical-weighted')
+save_table(eda,'r_12_eda_prevalence.csv')
+```
+
+```{r outcome-chart, fig.cap='Design-weighted descriptive prevalence. These bars do not show statistical significance or causal effects.'}
+p_prev <- ggplot(eda,aes(x=pufa_sfa_group,y=Weighted_percent,fill=Outcome))+
+  geom_col(position='dodge',width=.65)+
+  labs(title='Biomedically weighted abnormal lipid prevalence',x='PUFA:SFA group',
+       y='Weighted prevalence (%)',fill='Outcome')+
+  theme_minimal(base_size=12)+theme(axis.text.x=element_text(angle=15,hjust=1))
+print(p_prev)
+save_figure(p_prev,'r_12_weighted_prevalence.png')
+```
+
+# 4. Omega-3 and dietary composition
+
+The previously constructed `omega3_proxy_pct_pufa` is a **Day-1 omega-3 proxy as a proportion of total PUFA**; it is not a biomarker or a validated long-term omega-3 consumption measure. This quantity is mechanically linked to the PUFA denominator and should not be interpreted as an isolated omega-3 substitution effect.
+
+```{r omega-share}
+comp <- d[,.(N=.N,
+    Omega3_proxy_share_mean=mean(omega3_proxy_pct_pufa,na.rm=TRUE),
+    Omega3_proxy_share_median=median(omega3_proxy_pct_pufa,na.rm=TRUE),
+    Linoleic_share_mean=mean(linoleic_pct_pufa,na.rm=TRUE),
+    Energy_kJ_mean=mean(energy_kj_day1,na.rm=TRUE)),by=pufa_sfa_group][order(pufa_sfa_group)]
+format_table(comp,'Exploratory within-PUFA composition by observed ratio group')
+save_table(comp,'r_13_omega3_composition.csv')
+```
+
+```{r omega-chart, fig.cap='Observed omega-3 proxy share across high, low and intermediate PUFA:SFA groups'}
+p_omega <- ggplot(d[is.finite(omega3_proxy_pct_pufa)],
+    aes(x=pufa_sfa_group,y=omega3_proxy_pct_pufa))+
+  geom_boxplot(fill='#A8C5D8',outlier.alpha=.25)+
+  labs(title='Omega-3 proxy share within total PUFA',
+       x='PUFA:SFA group',y='Omega-3 proxy / total PUFA (%)')+
+  theme_minimal(base_size=12)+theme(axis.text.x=element_text(angle=15,hjust=1))
+print(p_omega)
+save_figure(p_omega,'r_13_omega3_share.png')
+```
+
+# 5. Initial findings
+
+1. The high-ratio category is substantially smaller than the low category. This imbalance is especially important in subsequent propensity-based estimation.
+2. Raw percentages and survey-weighted prevalence can differ. For instance, the sample's observed dietary groups are not equally representative of Australia's biomedical population.
+3. An elevated LDL or total cholesterol indicator is a **cross-sectional outcome**. These figures cannot establish how cholesterol would change if an individual altered their diet.
+4. Differences across dietary groups must be interpreted in the light of age, sex, location and socioeconomic factors, plus remaining confounding and diet measurement error.
+5. The next phase should compare standardised and propensity-adjusted contrasts with uncertainty intervals and sensitivity checks.
+
+# 6. Suggested next steps
+
+* Retain the continuous ratio and all three groups for EDA; use only high and low for the proposal-defined binary comparison.
+* Include weighting and uncertainty in the causal-methods report.
+* Examine omega-3 contribution only as an exploratory composition or interaction analysis and avoid nutrient-causality claims.

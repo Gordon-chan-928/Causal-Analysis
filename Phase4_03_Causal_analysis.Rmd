@@ -1,0 +1,177 @@
+---
+title: "STAT3888 — Phase 4: Causal analysis"
+subtitle: "Gordon | Preliminary causal-methods analysis of PUFA:SFA and cholesterol"
+author: "Gordon"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+source('_phase4_utils.R')
+sources <- phase4_load(reps=TRUE)
+d <- sources$data; repcols <- sources$replicate_columns
+base <- phase4_primary(copy(d), repcols)
+core <- c('age','sex','seifa_quintile','remoteness')
+```
+
+# 1. Research question and what we did
+
+**Question:** Among 18–64-year-old fasting NNPAS biomedical respondents, how does the adjusted prevalence of elevated total cholesterol differ between those reporting a PUFA:SFA ratio of 1.0–1.5 and those reporting a ratio below 0.45 on Day 1?
+
+We use outcome regression standardisation (**G-computation**), inverse probability weighting (**IPW**) and augmented IPW (**AIPW**). The primary background adjustment variables are age, sex, SEIFA quintile and remoteness. We incorporate biomedical survey expansion weights and refit the nuisance models for the 60 original jackknife replicate weights.
+
+**Interpretation restriction:** This study uses single-day dietary recall and cross-sectional lipid measurements. It does not identify a causal impact of changing dietary fatty acids. The reported contrasts are standardised and propensity-adjusted **associations**.
+
+# 2. Causal assumptions and conceptual DAG
+
+Plausible confounding includes demographic/socioeconomic position, prior lipid diagnosis, medication use, smoking and other health behaviours. Prior abnormal lipids could have led individuals to change their diets, creating reverse causation. Differences in dietary energy and the fat substitution represented by a PUFA:SFA ratio make causal interventions ambiguous.
+
+```{r dag}
+node <- data.table(node=c('Age/sex','SES/location','Previous health/medication',
+                          'Habitual diet','Day-1 PUFA:SFA','Blood lipid status'),
+                   x=c(1,1,1,3,5,7),y=c(3,2,1,2,2,2))
+edge <- data.table(from=c('Age/sex','Age/sex','SES/location','SES/location',
+                          'Previous health/medication','Previous health/medication',
+                          'Habitual diet','Habitual diet'),
+                   to=c('Habitual diet','Blood lipid status','Habitual diet','Blood lipid status',
+                        'Habitual diet','Blood lipid status','Day-1 PUFA:SFA','Blood lipid status'))
+edge <- merge(edge,node[,.(from=node,x0=x,y0=y)],by='from')
+edge <- merge(edge,node[,.(to=node,x1=x,y1=y)],by='to')
+p_dag <- ggplot()+geom_segment(data=edge,aes(x=x0,y=y0,xend=x1,yend=y1),
+              arrow=grid::arrow(length=grid::unit(.15,'cm')),colour='#6B7885')+
+  geom_label(data=node,aes(x=x,y=y,label=node),size=3.2,fill='white')+
+  coord_cartesian(xlim=c(.2,7.9),ylim=c(.3,3.7),clip='off')+
+  labs(title='Conceptual DAG: measured diet and prior health')+theme_void()
+print(p_dag);save_figure(p_dag,'r_20_conceptual_dag.png',10,4)
+```
+
+# 3. Analysis population and weights
+
+```{r sample-audit}
+count <- data.table(item=c('Fasting Phase 2 cohort','Primary high-versus-low sample',
+                           'High ratio (1.0–1.5)','Low ratio (<0.45)', 'Replicate weights'),
+                    value=c(nrow(d),nrow(base),sum(base$exposure==1),sum(base$exposure==0),length(repcols)))
+format_table(count,'Analysis sample audit')
+save_table(count,'r_20_sample_audit.csv')
+```
+
+# 4. Main adjusted analysis and design-based intervals
+
+For each estimator we calculate the standardised risk for the high and low ratio groups and their risk difference, defined as high minus low. The jackknife variance is computed as the scaled sum of squared differences between each replicate estimate and the full-sample estimate. Both propensity and outcome models are **refitted** in each replicate. If a replicate fails, confidence intervals are withheld.
+
+```{r main-estimates}
+basefit <- phase4_estimate(base,base$biomedical_weight,core)
+main <- phase4_replicate_rd(base,repcols,core)
+print(format_table(main,'Adjusted high-versus-low prevalence contrasts (RD in proportion units)'))
+save_table(main,'r_21_primary_adjusted_results.csv')
+cat('High-group IPW effective sample size:',round(basefit$ESS_high,2),'\n')
+cat('Low-group IPW effective sample size:',round(basefit$ESS_low,2),'\n')
+```
+
+```{r forest,fig.cap='95% jackknife intervals for the high-minus-low risk difference. All are adjusted associations.'}
+p_forest <- ggplot(main,aes(x=RD*100,y=method))+
+  geom_vline(xintercept=0,linetype='dashed',color='grey55')+
+  geom_errorbarh(aes(xmin=CI_low*100,xmax=CI_high*100),height=.15,color='#355E7C')+
+  geom_point(size=3,color='#355E7C')+
+  labs(title='Adjusted risk differences by method',
+       x='Risk difference in percentage points (High minus Low)',y=NULL)+
+  theme_minimal(base_size=12)
+print(p_forest)
+save_figure(p_forest,'r_21_primary_forest.png')
+```
+
+# 5. Propensity overlap and covariate balance checks
+
+```{r propensity}
+base[, propensity := basefit$ps]
+p_ps <- ggplot(base,aes(x=propensity,weight=biomedical_weight,
+               colour=factor(exposure,levels=0:1,labels=c('Low','High'))))+
+  geom_density(linewidth=1)+
+  labs(title='Estimated propensity score overlap',x='Probability of high group',
+       y='Weighted density',colour='Observed group')+theme_minimal(base_size=12)
+print(p_ps)
+save_figure(p_ps,'r_22_propensity_overlap.png')
+```
+
+Overlap and effective sample size are important because only `r sum(base$exposure==1)` participants belong to the high-ratio group. AIPW's double robustness does not resolve selection bias, unidentified interventions or unmeasured confounding.
+
+# 6. Sensitivity analysis: alternate reasonable choices
+
+Repeat the analysis using expanded adjustment variables, propensity clipping, exclusion of lipid-lowering medication users, and the secondary LDL outcome. These are **point estimates only**; comparison alone is not a significance test. Complete-case sample sizes can change.
+
+```{r sensitivity}
+run_one <- function(label, x, covars=core, outcome='total_chol_elevated',clip=0) {
+  z <- copy(x)
+  need <- c('exposure',outcome,'biomedical_weight',covars)
+  z <- z[complete.cases(z[,..need])]
+  if (nrow(z)<100 || min(table(z$exposure))<20)
+    return(data.table(Analysis=label,N=nrow(z),AIPW_RD=NA_real_))
+  fit <- tryCatch(phase4_estimate(z,z$biomedical_weight,covars,outcome,clip),error=function(e)e)
+  if (inherits(fit,'error')) return(data.table(Analysis=label,N=nrow(z),AIPW_RD=NA_real_))
+  data.table(Analysis=label,N=nrow(z),AIPW_RD=fit$estimates$RD[fit$estimates$method=='AIPW'])
+}
+base[, diabetes_status:=factor(diabetes_current,levels=0:1,labels=c('No diabetes','Diabetes'))]
+sens <- rbindlist(list(
+  run_one('Primary AIPW',base),
+  run_one('Expanded BMI, diabetes and energy',base,c(core,'bmi','diabetes_status','energy_kj_day1')),
+  run_one('Propensity clipped at 0.05–0.95',base,clip=0.05),
+  run_one('Exclude lipid-lowering medication',base[lipid_medication_group=='No lipid medication']),
+  run_one('Secondary elevated LDL outcome',base,outcome='ldl_chol_elevated')
+))
+sens[, AIPW_RD_pp:=100*AIPW_RD]
+format_table(sens,'Sensitivity analysis: changes in sample and AIPW point estimates')
+save_table(sens,'r_23_sensitivity_point_estimates.csv')
+```
+
+# 7. Omega-3 contribution: exploratory interaction
+
+To address the proposal's omega-3 subquestion, explore the interaction between the high-versus-low ratio exposure and the existing `omega3_proxy_pct_pufa` variable. This is an effect-modification analysis on the *log-odds scale*, not an estimate of how substituting omega-3 for omega-6 would alter lipid concentrations.
+
+```{r omega3-interaction}
+if (!requireNamespace('survey',quietly=TRUE)) stop('Install package survey: install.packages("survey")')
+omega <- copy(base[is.finite(omega3_proxy_pct_pufa) &
+                   omega3_proxy_pct_pufa>=0 & omega3_proxy_pct_pufa<=100])
+omega[, omega3_per10:=omega3_proxy_pct_pufa/10]
+if (sum(omega$exposure==1)>=20) {
+  des <- survey::svrepdesign(data=omega, weights=~biomedical_weight,
+    repweights=as.matrix(omega[,..repcols]), type='JK1',
+    scale=59/60, rscales=rep(1,length(repcols)),combined.weights=TRUE,mse=TRUE)
+  fit <- survey::svyglm(total_chol_elevated ~ exposure*omega3_per10 + age + sex +
+                          seifa_quintile + remoteness,
+                        design=des,family=quasibinomial())
+  coef_tbl <- coef(summary(fit))
+  key <- 'exposure:omega3_per10'
+  beta <- unname(coef_tbl[key,'Estimate'])
+  se_o <- unname(coef_tbl[key,'Std. Error'])
+  df_o <- max(1,survey::degf(des))
+  crit <- qt(.975,df=df_o)
+  omega_result <- data.table(contrast=key,N=nrow(omega),OR=exp(beta),
+    CI_low=exp(beta-crit*se_o),CI_high=exp(beta+crit*se_o),
+    p_value=2*pt(-abs(beta/se_o),df=df_o))
+} else omega_result <- data.table(note='Insufficient high-ratio participants')
+format_table(omega_result,'Exploratory omega-3 interaction')
+save_table(omega_result,'r_24_omega3_interaction.csv')
+```
+
+# 8. Interpretation of findings
+
+* Confidence intervals that include a zero risk difference do not establish benefit or harm.
+* The original proposal's high/low thresholds produce strongly unequal groups; this reduces precision and may complicate propensity weighting.
+* Medication exclusion and added covariates are robustness checks with potentially different populations and adjustment targets.
+* The interaction coefficient cannot establish an omega-3 nutrient-replacement mechanism.
+
+# 9. Limitations and future improvements
+
+1. **Cross-sectional and one-day dietary data:** temporality and stable exposure are not established.
+2. **Confounding and reverse causation:** pre-existing dyslipidaemia and medication use may influence eating patterns.
+3. **Overlap and precision:** the high PUFA:SFA category is small and has reduced IPW effective sample size.
+4. **Selection:** the Phase 2 cohort is fasting-only and contains biomedical respondents with valid records, so it differs from Stacy's broader outcome-specific analysis.
+5. **Survey inference:** the 60 Delete-a-Group Jackknife weights should be checked against the ABS technical manual, especially confidence interval conventions and the intended target population.
+6. **Future research:** model the ratio continuously, validate omega-3 composition against the dietary codebook, standardise comparator cohorts and examine missingness.
+
+**Overall conclusion:** An exploratory causal-methods framework has been completed, but the available cross-sectional estimates support only uncertain adjusted associations. They should not be reported as confirmed causal dietary treatment effects.

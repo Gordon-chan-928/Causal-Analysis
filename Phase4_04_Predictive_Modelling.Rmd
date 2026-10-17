@@ -1,0 +1,242 @@
+---
+title: "STAT3888 — Phase 4: Predictive modelling"
+subtitle: "Gordon | Machine learning assessment of PUFA:SFA, omega-3 and blood lipid status"
+author: "Gordon"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    code_folding: hide
+params:
+  rerun_independent_R_validation: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.width=8, fig.height=4.7)
+# This Rmd lives in Phase4_PUFA/code and uses precomputed, independently validated
+# cross-validation outputs from Phase4_PUFA/ml/tables. It does NOT source
+# _phase4_utils.R, to avoid the working-directory error reported earlier.
+root <- if (file.exists('../ml/tables/model_summary.csv')) '..' else if (file.exists('Phase4_PUFA/ml/tables/model_summary.csv')) 'Phase4_PUFA' else stop('Please open this Rmd from the original Phase4_PUFA/code folder. Keep ml/tables and ml/figures in the package.')
+ml_dir <- file.path(root, 'ml')
+table_dir <- file.path(ml_dir, 'tables')
+figure_dir <- file.path(ml_dir, 'figures')
+score <- read.csv(file.path(table_dir, 'model_summary.csv'), check.names=FALSE)
+delta <- read.csv(file.path(table_dir, 'incremental_performance.csv'), check.names=FALSE)
+cohort <- read.csv(file.path(table_dir, 'sample_and_prevalence.csv'), check.names=FALSE)
+folds <- read.csv(file.path(table_dir, 'outer_fold_metrics.csv'), check.names=FALSE)
+fmt <- function(x, n=3) format(round(x,n),nsmall=n)
+```
+
+# Research question and prediction target
+
+**Question:** Does adding the Day-1 PUFA:SFA ratio, alone or with an omega-3 composition proxy, improve the ability to classify **prevalent** elevated total cholesterol or elevated LDL in NNPAS 2011–12 biomedical respondents aged 18–64, beyond demographic, lifestyle and clinical predictors?
+
+This is a **machine-learning classification** task, intentionally separate from the high-versus-low causal-methods analysis in `Phase4_03_Causal_analysis.Rmd`. The outcome is a *same-survey binary laboratory abnormality*, **not** subsequent cardiovascular events or future dyslipidaemia. No causal effect or clinical decision tool is identified.
+
+# Data and eligibility
+
+The models use the 2,322-person fasting Phase 2 cohort and retain every participant with a nonmissing binary outcome and positive biomedical survey weight. The original 1,471-person high/low threshold analysis is not used as the training population. PUFA:SFA remains continuous to preserve exposure information. The two endpoints have different missingness and are evaluated separately.
+
+```{r cohort}
+cohort$N <- as.integer(cohort$N)
+cohort$cases <- as.integer(cohort$cases)
+cohort$weighted_prevalence <- 100*cohort$weighted_prevalence
+cohort$weighted_prevalence <- round(cohort$weighted_prevalence,1)
+knitr::kable(cohort[, c('Outcome','N','cases','weighted_prevalence')],
+             col.names=c('Binary outcome','N','Abnormal cases','Weighted prevalence (%)'),
+             caption='Available labelled populations; all are fasting at least eight hours.')
+```
+
+**Excluded as predictors:** cholesterol/LDL result codes, binary lipid outcome flags, dyslipidaemia composite and medication-derived outcome proxies; these could reveal the outcome or distort validation. The same participant is never in the training and test subset of any outer fold.
+
+# Predictors and learning algorithms
+
+| Predictor block | Variables | Rationale |
+|---|---|---|
+| Baseline | Age, sex, BMI, current diabetes, SEIFA quintile, remoteness, smoking, weekly MVPA, Day-1 alcohol and total dietary energy | Demographic, lifestyle and clinical baseline |
+| Added lipid ratio | Baseline plus continuous `log(1 + PUFA:SFA)` | Incremental information from fatty acid composition |
+| Added omega-3 | Above plus the proxy omega-3 percentage of total PUFA (scaled per ten percentage points) | Incremental dietary composition information |
+
+**Algorithms:** penalised logistic regression with an L2 penalty (**ridge classification**), and random forest classification as a nonlinear reference. Ridge models use three feature sets; forests compare baseline versus the full set. This ensures the *same algorithm and outer test folds* are used when attributing changes in prediction to the added diet variables. The base model already includes total dietary energy.
+
+Numeric predictors are median-imputed and standardised using **training-only** estimates; categorical predictors are mode-imputed and one-hot encoded. Weekly MVPA, alcohol, energy and the fatty acid ratio receive `log1p` transformations. The transformations are applied identically to held-out rows, avoiding test-set leakage.
+
+# Validation and hyperparameter tuning
+
+The reported numeric results were independently obtained using Python scikit-learn; the full source is included as `ml/train_validate.py`. An equivalent end-to-end **R implementation** is supplied below and may be executed by setting `rerun_independent_R_validation: true` in this Rmd's YAML. Python and R use separate random-number generators and regularisation conventions, so their numerical results need not be identical.
+
+* **Ridge:** five stratified outer folds, repeated twice, with three inner folds for choosing the L2 penalty (`C = 0.03, 0.3, 3`). Ten outer-fold estimates per endpoint and predictor specification.
+* **Random forest:** five stratified outer folds, three inner folds for minimum leaf size (`12, 30`); 110 trees per fitted forest.
+* All training models use normalised positive biomedical survey weights; test ROC-AUC, Brier score and log loss are survey-weighted.
+* Candidate tuning occurs **only inside each training fold**. Each test fold remains untouched until evaluation.
+
+Ridge and random forest outer averages should **not** be treated as inferential confidence intervals. Repeated test folds overlap, and stratified random cross-validation does not fully capture clustered/stratified survey-design uncertainty.
+
+# Main predictive performance
+
+```{r primary-results}
+show <- score[,c('Outcome','Algorithm','Features','AUC','Brier','LogLoss','Folds')]
+show$AUC <- round(show$AUC,3);show$Brier<-round(show$Brier,3)
+show$LogLoss<-round(show$LogLoss,3)
+show <- show[order(show$Outcome,show$Algorithm,show$Features),]
+knitr::kable(show, caption='Mean survey-weighted outer-test performance. Higher AUC and lower Brier/log loss are better.')
+```
+
+Baseline ridge discrimination was approximately **0.688 for elevated total cholesterol** and **0.695 for elevated LDL**. Predictive discrimination is moderate, and there is no external validation. A model with AUC around 0.69 is not suitable for clinical screening on this evidence alone.
+
+# Incremental predictive contribution of PUFA:SFA and omega-3
+
+```{r incremental}
+change <- delta[,c('Outcome','Algorithm','Added','mean_delta_AUC','folds_improved_AUC','folds','mean_delta_Brier')]
+change$mean_delta_AUC <- round(change$mean_delta_AUC,4)
+change$mean_delta_Brier <- round(change$mean_delta_Brier,4)
+knitr::kable(change,caption='Paired comparison against the corresponding baseline model. Positive delta AUC and negative delta Brier indicate improvement.')
+```
+
+Adding the dietary composition variables **did not improve average held-out AUC or Brier score** for either target in the tested specifications. Ridge with PUFA:SFA alone changed mean AUC by approximately `r fmt(delta$mean_delta_AUC[delta$Outcome=='total_chol_elevated' & delta$Algorithm=='Ridge logistic' & delta$Added=='Baseline + PUFA:SFA'],4)` for total cholesterol and `r fmt(delta$mean_delta_AUC[delta$Outcome=='ldl_chol_elevated' & delta$Algorithm=='Ridge logistic' & delta$Added=='Baseline + PUFA:SFA'],4)` for LDL. The fully dietary-augmented ridge models performed slightly worse on average. This speaks to incremental **prediction in this model/validation scheme**; it does not establish that PUFA or omega-3 have no biological effects.
+
+```{r incremental-fig, out.width='90%', fig.cap='Paired ten-fold weighted AUC changes in ridge predictions when dietary composition is added to the baseline.'}
+knitr::include_graphics(file.path(figure_dir,'delta_total_chol_elevated.png'))
+knitr::include_graphics(file.path(figure_dir,'delta_ldl_chol_elevated.png'))
+```
+
+# Discrimination and probability calibration
+
+```{r roc-fig, out.width='95%', fig.cap='Representative pooled out-of-fold ROC curves. Each observation was predicted from a model whose training data excluded that observation.'}
+knitr::include_graphics(file.path(figure_dir,'roc_total_chol_elevated.png'))
+knitr::include_graphics(file.path(figure_dir,'roc_ldl_chol_elevated.png'))
+```
+
+```{r calibration-fig, out.width='95%', fig.cap='Eight weighted prediction-risk groups; deviations from the diagonal indicate imperfect calibration. This is an exploratory calibration display.'}
+knitr::include_graphics(file.path(figure_dir,'calibration_total_chol_elevated.png'))
+knitr::include_graphics(file.path(figure_dir,'calibration_ldl_chol_elevated.png'))
+```
+
+# Connection to the STAT3888 group analyses
+
+**Stacy:** models saturated fat as percentage of energy and four lipid endpoints. The current machine-learning model tests the *incremental predictive utility* of PUFA:SFA and omega-3, not Stacy's specific saturated-fat treatment comparison. Direct benchmark comparison would require common endpoints, identical eligible participants and cross-validation folds.
+
+**Thomas:** has already separated association from prediction and estimated incremental performance for a fibre-to-carbohydrate ratio using ridge and cross-validation. The present results use a similar analytical question, but a different fasting-only sample and different baseline covariates; raw AUC levels should not be compared as if identical test populations had been used.
+
+# Limitations, interpretation and improvement
+
+1. **Cross-sectional measurement:** all labels describe current lipid abnormality; this is not temporal disease prediction.
+2. **Selection:** Phase 2 participants are already limited to an available fasting biomedical subset, potentially affecting transportability. Absence of an independent NNPAS holdout or external cohort prevents claims about generalisation.
+3. **Classifiers:** adding a variable can fail to improve prediction even when it has a biologically plausible association. This is an observation about *incremental predictive performance*, not proof of no effect.
+4. **Weights:** biomedical survey weights were incorporated; outer-fold AUC variability is not a survey-design confidence interval. A planned improvement is to assess uncertainty using appropriate design-aware validation.
+5. **Measurement error and missingness:** dietary variables represent a single recall day; missing BMI and MVPA values are imputed from training data only; class probabilities may need separate external calibration.
+6. **Comparability:** harmonise eligible participants, outcome definitions, core predictors and folds with Stacy/Thomas before using cross-workstream comparisons in a final combined conclusion.
+
+**Conclusion:** Using the available Phase 2 fasting sample, ridge and random forest yielded moderate internal discrimination but no observed gain from adding Day-1 PUFA:SFA and omega-3 composition measures. The most defensible interpretation is limited added predictive information *beyond this baseline, in this cohort*, not the absence of dietary relevance.
+
+# Optional independent R re-estimation
+
+The following chunk contains a self-contained R machine-learning workflow. It is disabled by default so the report can Knit using the **verified output tables** without requiring modelling packages. Set `rerun_independent_R_validation: true` at the beginning of this file to execute a second nested-CV analysis in R. It writes `r_reestimated_outer_fold_metrics.csv` and a summary under `ml/tables` without altering the independently verified Python tables.
+
+```{r optional_r_training, eval=params$rerun_independent_R_validation, echo=TRUE}
+if (!requireNamespace('glmnet',quietly=TRUE)) stop('install.packages("glmnet")')
+if (!requireNamespace('ranger',quietly=TRUE)) stop('install.packages("ranger")')
+x <- read.csv(file.path(ml_dir,'ML_analysis_ready.csv'), stringsAsFactors=FALSE)
+for (col in c('mvpa_equiv_min_week','alcohol_g_day1','energy_kj_day1','pufa_sfa_ratio'))
+  x[[paste0('log1p_',col)]] <- log1p(x[[col]])
+x$omega3_per10 <- x$omega3_proxy_pct_pufa/10
+cats <- c('sex','seifa_quintile','remoteness','smoking3')
+num_base <- c('age','bmi','diabetes_current','log1p_mvpa_equiv_min_week',
+              'log1p_alcohol_g_day1','log1p_energy_kj_day1')
+set_base <- c(num_base,cats)
+sets <- list(Baseline=set_base, Ratio=c(set_base,'log1p_pufa_sfa_ratio'),
+  FullDiet=c(set_base,'log1p_pufa_sfa_ratio','omega3_per10'))
+# Weighted rank AUC. Continuous ridge/RF scores make exact ties uncommon.
+w_auc <- function(y,p,w){
+  ix <- order(p);y <- y[ix];w <- w[ix]
+  wp <- ifelse(y==1,w,0);wn<-ifelse(y==0,w,0)
+  sum(wp * (cumsum(wn)-0.5*wn)) / (sum(wp)*sum(wn))
+}
+w_brier <- function(y,p,w) weighted.mean((y-p)^2,w)
+makefolds <- function(y,k=5,seed=1){
+  set.seed(seed); fold <- integer(length(y))
+  for (v in 0:1){ ids <- sample(which(y==v)); fold[ids] <- rep(seq_len(k),length.out=length(ids)) }
+  fold
+}
+# Fit and apply preprocessing using TRAINING data only.
+encode <- function(train,test,features){
+  a <- train[,features,drop=FALSE];b <- test[,features,drop=FALSE]
+  for (v in intersect(cats,features)){
+    a[[v]][is.na(a[[v]])] <- 'Missing'; b[[v]][is.na(b[[v]])] <- 'Missing'
+    lev <- sort(unique(c(as.character(a[[v]]),as.character(b[[v]]))))
+    a[[v]] <- factor(a[[v]],levels=lev);b[[v]] <- factor(b[[v]],levels=lev)
+  }
+  for(v in setdiff(features,cats)){
+    med <- median(a[[v]],na.rm=TRUE)
+    if(!is.finite(med)) med<-0
+    a[[v]][!is.finite(a[[v]])] <- med
+    b[[v]][!is.finite(b[[v]])] <- med
+  }
+  mm <- function(z) model.matrix(~ . -1,data=z)
+  list(xt=mm(a), xv=mm(b))
+}
+fitpredict <- function(tr,te,features,method,param){
+  z <- encode(tr,te,features)
+  yy <- as.integer(tr$.y);w <- tr$.w / mean(tr$.w)
+  if (method=='Ridge'){
+    model <- glmnet::glmnet(z$xt,yy,alpha=0,family='binomial',lambda=param,
+                            weights=w,standardize=TRUE)
+    as.numeric(predict(model,newx=z$xv,s=param,type='response'))
+  }else{
+    zz <- data.frame(response=factor(yy,levels=c(0,1)),z$xt,check.names=TRUE)
+    model <- ranger::ranger('response',data=zz,probability=TRUE,num.trees=110,
+                             min.node.size=param,case.weights=w,seed=2026)
+    vv <- data.frame(z$xv,check.names=TRUE)
+    as.numeric(predict(model,data=vv)$predictions[,'1'])
+  }
+}
+reestimate <- list()
+for (target in c('total_chol_elevated','ldl_chol_elevated')){
+  d <- x[!is.na(x[[target]]) & is.finite(x$NHMSPERW) & x$NHMSPERW>0,]
+  d$.y<-as.integer(d[[target]]); d$.w<-d$NHMSPERW
+  for (method in c('Ridge','Forest')){
+    blocks <- if(method=='Ridge') names(sets) else c('Baseline','FullDiet')
+    repeats <- if(method=='Ridge') 2 else 1
+    opts <- if(method=='Ridge') c(.001,.01,.1,1) else c(12,30)
+    for (rr in seq_len(repeats)){
+      oo <- makefolds(d$.y,5,3888+rr)
+      for (kk in seq_len(5)){
+        tr <- d[oo!=kk,];te <- d[oo==kk,]
+        inner <- makefolds(tr$.y,3,211+kk+10*rr)
+        for (name in blocks){
+          features <- sets[[name]]
+          tuning <- sapply(opts,function(v){
+            as.numeric(mean(sapply(seq_len(3),function(j){
+              aa<-tr[inner!=j,];bb<-tr[inner==j,]
+              pr<-fitpredict(aa,bb,features,method,v)
+              w_auc(bb$.y,pr,bb$.w)
+            })))
+          })
+          selected <- opts[which.max(tuning)]
+          pred <- fitpredict(tr,te,features,method,selected)
+          reestimate[[length(reestimate)+1]] <- data.frame(
+            Outcome=target,Algorithm=method,Features=name,Repeat=rr,Fold=kk,
+            AUC=w_auc(te$.y,pred,te$.w),Brier=w_brier(te$.y,pred,te$.w),Hyperparameter=selected)
+        }
+      }
+    }
+  }
+}
+rr <- do.call(rbind,reestimate)
+write.csv(rr,file.path(table_dir,'r_reestimated_outer_fold_metrics.csv'),row.names=FALSE)
+rr_summary <- aggregate(cbind(AUC,Brier)~Outcome+Algorithm+Features,data=rr,FUN=mean)
+write.csv(rr_summary,file.path(table_dir,'r_reestimated_model_summary.csv'),row.names=FALSE)
+knitr::kable(rr_summary,digits=4,caption='Independent R re-estimation; random folds and tuning differ from the Python verification.')
+```
+
+# Practical use of a fitted classifier
+
+After completing cross-validation, the accompanying `ml/fit_predict.py` fits final ridge models on **all labelled data**. These are saved in `ml/models` for exploratory classification of other records using the same variables and coding. Use only the out-of-fold results above to assess performance. To produce probability columns for new compatible input rows:
+
+```
+python ml/fit_predict.py --predict ml/example_predictors.csv --output ml/predicted_probabilities.csv
+```
+
+The models require age, BMI, current diabetes, sex, SEIFA, remoteness, smoking, MVPA, alcohol, energy, PUFA:SFA and omega-3 percentage. They do not predict subsequent illness and are **not validated for personal medical assessment**.
